@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Rvt2GltfConverter/Rvt2GltfConverter.csproj" Id="971ce369-7370-4242-881b-873f2b12835d" />
+  <Project Path="RvtToGltfExporter/RvtToGltfExporter.csproj" />
+</Solution>
