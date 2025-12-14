@@ -19,32 +19,66 @@ namespace Rvt2GltfConverter
                 var output = Request.OutputPath;
 
                 if (string.IsNullOrEmpty(input) || !File.Exists(input))
-                    return;
+                    throw new FileNotFoundException("Input RVT bulunamadı.", input);
 
-                // 1) RVT dokümanını aç
-                var doc = app.Application.OpenDocumentFile(input);
+                Document doc = null;
 
                 try
                 {
-                    // 2) GLTF'e ÇEVİR (ARTIK GERÇEK EXPORT)
+                    // ✅ Dialog/Worksharing sorunlarını azaltan güvenli açılış
+                    var openOpt = new OpenOptions
+                    {
+                        Audit = true
+                    };
+
+                    // Central / Workshared dosyalarda otomasyon için en güvenlisi:
+                    openOpt.DetachFromCentralOption = DetachFromCentralOption.DetachAndDiscardWorksets;
+
+                    // Worksetleri kapalı aç (performans + popup azaltır)
+                    var wsConfig = new WorksetConfiguration(WorksetConfigurationOption.CloseAllWorksets);
+                    openOpt.SetOpenWorksetsConfiguration(wsConfig);
+
+                    var modelPath = ModelPathUtils.ConvertUserVisiblePathToModelPath(input);
+                    doc = app.Application.OpenDocumentFile(modelPath, openOpt);
+
+                    // ✅ Export
                     RevitGltfExporter.ExportToGltf(doc, output);
                 }
                 finally
                 {
-                    // 3) Dokümanı kapat
-                    doc.Close(false);
+                    if (doc != null)
+                    {
+                        try { doc.Close(false); } catch { }
+                    }
                 }
 
-                // 4) Revit'i kapat (Exit komutunu post et)
+                // ✅ Revit'i kapat
                 var exitCommandId =
                     RevitCommandId.LookupPostableCommandId(PostableCommand.ExitRevit);
                 app.PostCommand(exitCommandId);
             }
             catch (Exception ex)
             {
-                File.AppendAllText(
-                    @"C:\temp\revit_http_addin.log",
-                    DateTime.Now.ToString("u") + " HATA: " + ex + Environment.NewLine);
+                // ✅ API tarafı da anlayabilsin diye error dosyası üret
+                try
+                {
+                    var outp = Request?.OutputPath;
+                    if (!string.IsNullOrEmpty(outp))
+                    {
+                        File.WriteAllText(outp + ".error.txt", ex.ToString());
+                    }
+                }
+                catch { }
+
+                // Mevcut log
+                try
+                {
+                    Directory.CreateDirectory(@"C:\temp");
+                    File.AppendAllText(
+                        @"C:\temp\revit_http_addin.log",
+                        DateTime.Now.ToString("u") + " HATA: " + ex + Environment.NewLine);
+                }
+                catch { }
             }
         }
 

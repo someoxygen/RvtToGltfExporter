@@ -38,17 +38,22 @@ namespace RvtToGltfExporter.Services
             using var process = new Process { StartInfo = psi };
             process.Start();
 
-            // log’ları istersen okuyabilirsin
             var stdoutTask = process.StandardOutput.ReadToEndAsync();
             var stderrTask = process.StandardError.ReadToEndAsync();
 
-            // timeout: 10 dakika
             var timeout = TimeSpan.FromMinutes(10);
-            if (await Task.WhenAny(process.WaitForExitAsync(ct), Task.Delay(timeout, ct)) != process.WaitForExitAsync(ct))
+
+            // ✅ DOĞRU WAIT/TIMEOUT KONTROLÜ
+            var waitTask = process.WaitForExitAsync(ct);
+            var finished = await Task.WhenAny(waitTask, Task.Delay(timeout, ct));
+
+            if (finished != waitTask)
             {
                 try { process.Kill(true); } catch { }
                 throw new TimeoutException("RevitCoreConsole zaman aşımına uğradı.");
             }
+
+            await waitTask;
 
             var stdout = await stdoutTask;
             var stderr = await stderrTask;
