@@ -1,0 +1,52 @@
+<div class="page">
+  <div class="shell">
+    <header class="header">
+      <div class="brand">
+        <div class="logo">⛭</div>
+        <div>
+          <h1>RVT → glTF Converter</h1>
+          <p>Upload a .rvt file, convert it on the backend, preview it, and download outputs.</p>
+        </div>
+      </div>
+    </header>
+
+    <section class="card">
+      <div class="controls">
+        <label class="file">
+          <input type="file" accept=".rvt" (change)="onPickFile($event)" />
+          <span class="file-btn">Choose RVT</span>
+          <span class="file-name">{{ selectedFile?.name ?? 'No file selected' }}</span>
+        </label>
+
+        <button class="primary" (click)="convert()" [disabled]="!selectedFile || loading">
+          <span *ngIf="!loading">Convert</span>
+          <span *ngIf="loading" class="spinner"></span>
+          <span *ngIf="loading">Converting…</span>
+        </button>
+      </div>
+
+      <div class="error" *ngIf="errorText">
+        <div class="error-title">Conversion failed</div>
+        <pre>{{ errorText }}</pre>
+      </div>
+
+      <div class="success" *ngIf="result as r">
+        <div class="success-bar">
+          <div class="ok">✅ Converted</div>
+          <div class="links">
+            <a [href]="r.gltfUrl" target="_blank" rel="noopener">Download GLTF</a>
+            <a *ngIf="r.binUrl" [href]="r.binUrl" target="_blank" rel="noopener">Download BIN</a>
+            <a *ngIf="r.zipUrl" [href]="r.zipUrl" target="_blank" rel="noopener">Download ZIP</a>
+          </div>
+        </div>
+
+        <app-viewer [gltfUrl]="r.gltfUrl"></app-viewer>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <span>Backend: http://localhost:5197</span>
+      <span>Jobs: http://localhost:5197/jobs/&lt;jobId&gt;/output.gltf</span>
+    </footer>
+  </div>
+</div>

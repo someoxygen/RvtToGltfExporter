@@ -1,19 +1,21 @@
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.FileProviders;
 using Microsoft.OpenApi;
 using System.Diagnostics;
+using System.IO.Compression;
 using System.Net.Http.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.WebHost.ConfigureKestrel(o =>
 {
-    o.Limits.MaxRequestBodySize = 1024L * 1024L * 1024L; // 1 GB
+    o.Limits.MaxRequestBodySize = 1024L * 1024L * 1024L;
 });
 
 builder.Services.Configure<FormOptions>(o =>
 {
-    o.MultipartBodyLengthLimit = 1024L * 1024L * 1024L; // 1 GB
+    o.MultipartBodyLengthLimit = 1024L * 1024L * 1024L;
 });
 
 builder.Services.AddHttpClient();
@@ -30,13 +32,22 @@ builder.Services.AddSwaggerGen(options =>
     });
 });
 
+builder.Services.AddCors(opt =>
+{
+    opt.AddPolicy("ui", p =>
+        p.WithOrigins("http://localhost:4200")
+         .AllowAnyHeader()
+         .AllowAnyMethod()
+         .WithExposedHeaders("Content-Disposition"));
+});
+
 var app = builder.Build();
 
 app.Use(async (ctx, next) =>
 {
     var feature = ctx.Features.Get<IHttpMaxRequestBodySizeFeature>();
     if (feature != null && !feature.IsReadOnly)
-        feature.MaxRequestBodySize = 1024L * 1024L * 1024L; // 1 GB
+        feature.MaxRequestBodySize = 1024L * 1024L * 1024L;
 
     await next();
 });
@@ -47,156 +58,184 @@ app.UseSwaggerUI(c =>
     c.SwaggerEndpoint("/swagger/v1/swagger.json", "RVT to glTF Converter API v1");
 });
 
+app.UseCors("ui");
+
+var jobsRoot = app.Configuration["RvtToGltf:JobsRoot"] ?? @"C:\RvtToGltf\Jobs";
+Directory.CreateDirectory(jobsRoot);
+
+app.UseStaticFiles(new StaticFileOptions
+{
+    FileProvider = new PhysicalFileProvider(jobsRoot),
+    RequestPath = "/jobs",
+    ServeUnknownFileTypes = true
+});
+
+static string GetBaseUrl(HttpRequest req) => $"{req.Scheme}://{req.Host}";
+
 app.MapPost("/convert", async (
+        HttpRequest request,
         IFormFile rvtFile,
         IConfiguration config,
         IHttpClientFactory httpClientFactory,
         CancellationToken cancellationToken) =>
 {
-    try
+    if (rvtFile == null || rvtFile.Length == 0)
+        return Results.BadRequest(new { title = "Invalid file", detail = "RVT dosyasý boþ." });
+
+    var jobsRootLocal = config["RvtToGltf:JobsRoot"] ?? @"C:\RvtToGltf\Jobs";
+    Directory.CreateDirectory(jobsRootLocal);
+
+    var jobId = Guid.NewGuid().ToString("N");
+    var jobFolder = Path.Combine(jobsRootLocal, jobId);
+    Directory.CreateDirectory(jobFolder);
+
+    var inputRvtPath = Path.Combine(jobFolder, "input.rvt");
+    var outputGltfPath = Path.Combine(jobFolder, "output.gltf");
+    var outputBinPath = Path.Combine(jobFolder, "output.bin");
+    var outputZipPath = Path.Combine(jobFolder, "output.zip");
+    var errorPath = outputGltfPath + ".error.txt";
+
+    await using (var fs = new FileStream(inputRvtPath, FileMode.Create, FileAccess.Write, FileShare.Read))
     {
-        if (rvtFile == null || rvtFile.Length == 0)
-            return Results.BadRequest("RVT dosyasý boþ.");
+        await rvtFile.CopyToAsync(fs, cancellationToken);
+    }
 
-        var jobsRoot = config["RvtToGltf:JobsRoot"] ?? @"C:\RvtToGltf\Jobs";
-        Directory.CreateDirectory(jobsRoot);
+    var revitExePath = config["Revit:ExePath"] ?? @"C:\Program Files\Autodesk\Revit 2026\Revit.exe";
+    if (!File.Exists(revitExePath))
+        return Results.Problem($"Revit.exe yolu geçersiz: {revitExePath}");
 
-        var jobId = Guid.NewGuid().ToString("N");
-        var jobFolder = Path.Combine(jobsRoot, jobId);
-        Directory.CreateDirectory(jobFolder);
+    // Revit baþlat
+    var psi = new ProcessStartInfo
+    {
+        FileName = revitExePath,
+        Arguments = "/nosplash",
+        UseShellExecute = true
+    };
 
-        var inputRvtPath = Path.Combine(jobFolder, "input.rvt");
-        var outputGltfPath = Path.Combine(jobFolder, "output.gltf");
-        var errorPath = outputGltfPath + ".error.txt";
+    var revitProcess = Process.Start(psi);
+    if (revitProcess == null)
+        return Results.Problem("Revit.exe baþlatýlamadý.");
 
-        await using (var fs = new FileStream(inputRvtPath, FileMode.Create, FileAccess.Write))
+    var http = httpClientFactory.CreateClient();
+
+    var readyUntil = DateTime.UtcNow.AddMinutes(2);
+    bool ready = false;
+
+    while (DateTime.UtcNow < readyUntil)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        try
         {
-            await rvtFile.CopyToAsync(fs, cancellationToken);
+            using var ping = new HttpRequestMessage(HttpMethod.Get, "http://localhost:5005/convert/");
+            var pingRes = await http.SendAsync(ping, cancellationToken);
+            if (pingRes.IsSuccessStatusCode)
+            {
+                ready = true;
+                break;
+            }
+        }
+        catch { }
+
+        await Task.Delay(1000, cancellationToken);
+    }
+
+    if (!ready)
+        return Results.Problem("Revit addin HTTP servisi (localhost:5005) hazýr olmadý. Addin yüklenmiyor olabilir.");
+
+    var payload = new { inputPath = inputRvtPath, outputPath = outputGltfPath };
+
+    HttpResponseMessage? response = null;
+    Exception? lastError = null;
+
+    var start = DateTime.UtcNow;
+    var timeoutConnect = TimeSpan.FromMinutes(2);
+
+    while (DateTime.UtcNow - start < timeoutConnect)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        try
+        {
+            response = await http.PostAsJsonAsync("http://localhost:5005/convert/", payload, cancellationToken);
+            if (response.IsSuccessStatusCode)
+                break;
+        }
+        catch (HttpRequestException ex)
+        {
+            lastError = ex;
         }
 
-        var revitExePath = config["Revit:ExePath"] ?? @"C:\Program Files\Autodesk\Revit 2026\Revit.exe";
-        if (!File.Exists(revitExePath))
-            return Results.Problem($"Revit.exe yolu geçersiz: {revitExePath}");
+        await Task.Delay(2000, cancellationToken);
+    }
 
-        var psi = new ProcessStartInfo
+    if (response == null)
+        return Results.Problem("Revit HTTP servisine baðlanýlamadý (localhost:5005). Detay: " + lastError?.Message);
+
+    if (!response.IsSuccessStatusCode)
+    {
+        var txt = await response.Content.ReadAsStringAsync(cancellationToken);
+        return Results.Problem($"Revit addin isteði baþarýsýz. Status: {(int)response.StatusCode}, Body: {txt}");
+    }
+
+    var deadline = DateTime.UtcNow.AddMinutes(10);
+
+    while (!File.Exists(outputGltfPath))
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (File.Exists(errorPath))
         {
-            FileName = revitExePath,
-            Arguments = "/nosplash",
-            UseShellExecute = true
-        };
-
-        var revitProcess = Process.Start(psi);
-        if (revitProcess == null)
-            return Results.Problem("Revit.exe baþlatýlamadý.");
-
-        var http = httpClientFactory.CreateClient();
-
-        var readyUntil = DateTime.UtcNow.AddMinutes(2);
-        bool ready = false;
-
-        while (DateTime.UtcNow < readyUntil)
-        {
-            try
-            {
-                using var ping = new HttpRequestMessage(HttpMethod.Get, "http://localhost:5005/convert/");
-                var pingRes = await http.SendAsync(ping, cancellationToken);
-                if (pingRes.IsSuccessStatusCode)
-                {
-                    ready = true;
-                    break;
-                }
-            }
-            catch
-            {
-                // daha hazýr deðil
-            }
-
-            await Task.Delay(1000, cancellationToken);
+            var err = await File.ReadAllTextAsync(errorPath, cancellationToken);
+            return Results.Problem("Revit addin conversion hatasý:\n" + err);
         }
 
-        if (!ready)
-            return Results.Problem("Revit addin HTTP servisi (localhost:5005) hazýr olmadý. Addin yüklenmiyor olabilir.");
+        if (DateTime.UtcNow > deadline)
+            return Results.Problem("GLTF oluþturma zaman aþýmýna uðradý.");
 
-        var payload = new { inputPath = inputRvtPath, outputPath = outputGltfPath };
+        await Task.Delay(1000, cancellationToken);
+    }
 
-        HttpResponseMessage? response = null;
-        Exception? lastError = null;
+    var baseUrl = GetBaseUrl(request);
+    var gltfUrl = $"{baseUrl}/jobs/{jobId}/output.gltf";
+    string? binUrl = File.Exists(outputBinPath) ? $"{baseUrl}/jobs/{jobId}/output.bin" : null;
+    string? zipUrl = File.Exists(outputZipPath) ? $"{baseUrl}/jobs/{jobId}/output.zip" : null;
 
-        var start = DateTime.UtcNow;
-        var timeoutConnect = TimeSpan.FromMinutes(2);
-
-        while (DateTime.UtcNow - start < timeoutConnect)
-        {
-            try
-            {
-                response = await http.PostAsJsonAsync("http://localhost:5005/convert/", payload, cancellationToken);
-                if (response.IsSuccessStatusCode)
-                    break;
-            }
-            catch (HttpRequestException ex)
-            {
-                lastError = ex;
-            }
-
-            await Task.Delay(2000, cancellationToken);
-        }
-
-        if (response == null)
-            return Results.Problem("Revit HTTP servisine baðlanýlamadý (localhost:5005). Detay: " + lastError?.Message);
-
-        if (!response.IsSuccessStatusCode)
-        {
-            var txt = await response.Content.ReadAsStringAsync(cancellationToken);
-            return Results.Problem($"Revit addin isteði baþarýsýz. Status: {(int)response.StatusCode}, Body: {txt}");
-        }
-
-        var timeout = DateTime.UtcNow.AddMinutes(10);
-
-        while (!File.Exists(outputGltfPath))
-        {
-            if (File.Exists(errorPath))
-            {
-                var err = await File.ReadAllTextAsync(errorPath, cancellationToken);
-                return Results.Problem("Revit addin conversion hatasý:\n" + err);
-            }
-
-            if (DateTime.UtcNow > timeout)
-                return Results.Problem("GLTF oluþturma zaman aþýmýna uðradý.");
-
-            await Task.Delay(1000, cancellationToken);
-        }
-
-        var gltfBytes = await File.ReadAllBytesAsync(outputGltfPath, cancellationToken);
-        var downloadName = Path.GetFileNameWithoutExtension(rvtFile.FileName) + ".gltf";
-
+    _ = Task.Run(() =>
+    {
         try
         {
             if (!revitProcess.HasExited)
             {
-                if (!revitProcess.WaitForExit(30000))
+                if (!revitProcess.WaitForExit(5000))
                     revitProcess.Kill();
             }
         }
         catch { }
 
-        return Results.File(
-            fileContents: gltfBytes,
-            contentType: "model/gltf+json",
-            fileDownloadName: downloadName
-        );
-    }
-    catch (Exception ex)
-    {
-        Directory.CreateDirectory(@"C:\temp");
-        await File.AppendAllTextAsync(@"C:\temp\convert_endpoint.log",
-            DateTime.Now.ToString("u") + " EX: " + ex + Environment.NewLine, cancellationToken);
+        // ZIP yoksa üretmeyi burada da yapabilirsin
+        try
+        {
+            if (!File.Exists(outputZipPath))
+            {
+                using var zip = ZipFile.Open(outputZipPath, ZipArchiveMode.Create);
+                zip.CreateEntryFromFile(outputGltfPath, "output.gltf");
+                if (File.Exists(outputBinPath))
+                    zip.CreateEntryFromFile(outputBinPath, "output.bin");
+            }
+        }
+        catch { }
+    });
 
-        return Results.Problem("Convert endpoint exception: " + ex.Message);
-    }
+    return Results.Ok(new
+    {
+        jobId,
+        gltfUrl,
+        binUrl,
+        zipUrl
+    });
 })
 .DisableAntiforgery()
 .Accepts<IFormFile>("multipart/form-data")
-.Produces<FileContentResult>(StatusCodes.Status200OK, "model/gltf+json")
+.Produces(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status400BadRequest)
 .ProducesProblem(StatusCodes.Status500InternalServerError);
 
