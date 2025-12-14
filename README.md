@@ -10,7 +10,7 @@ Rvt2GltfConverter.addin
 <RevitAddIns>
   <AddIn Type="Application">
     <Name>RvtHttpService</Name>
-    <Assembly>C:\Users\pjouf\Desktop\Projects\RvtToGltfExporter\Rvt2GltfConverter\bin\Release\Rvt2GltfConverter.dll</Assembly>
+    <Assembly>C:\ProgramData\Autodesk\Revit\Addins\2026\Rvt2GltfConverter\Rvt2GltfConverter.dll</Assembly>
     <FullClassName>Rvt2GltfConverter.RvtHttpServiceApp</FullClassName>
     <AddInId>8A2E01CB-AAAA-BBBB-CCCC-DDDDDDDDDDDD</AddInId>
     <VendorId>MYCO</VendorId>
